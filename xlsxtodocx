@@ -1,0 +1,192 @@
+import io
+import re
+import pandas as pd
+from google.colab import files
+from docx import Document
+from docx.shared import RGBColor
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+import docx.opc.constants
+
+def hex_to_rgb(hex_str):
+    try:
+        return RGBColor(int(hex_str[:2], 16), int(hex_str[2:4], 16), int(hex_str[4:], 16))
+    except: return None
+
+def apply_shading_to_run(run, hex_color):
+    if not hex_color: return
+    rPr = run._element.get_or_add_rPr()
+    # Remove existing shading if any
+    existing_shd = rPr.find(qn('w:shd'))
+    if existing_shd is not None:
+        rPr.remove(existing_shd)
+    
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), hex_color)
+    rPr.append(shd)
+
+def add_hyperlink_run(paragraph, url, text, bold, italic, underline, color, bg_color):
+    part = paragraph.part
+    r_id = part.relate_to(url, docx.opc.constants.RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
+    
+    run = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+
+    if bold: rPr.append(OxmlElement('w:b'))
+    if italic: rPr.append(OxmlElement('w:i'))
+    
+    if not color:
+        color = "0000FF"
+        underline = True
+
+    if underline:
+        u = OxmlElement('w:u')
+        u.set(qn('w:val'), 'single')
+        rPr.append(u)
+    
+    if color:
+        c = OxmlElement('w:color')
+        c.set(qn('w:val'), color)
+        rPr.append(c)
+        
+    if bg_color:
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), bg_color)
+        rPr.append(shd)
+
+    if len(rPr): run.append(rPr)
+
+    t = OxmlElement('w:t')
+    if len(text.strip()) < len(text): t.set(qn('xml:space'), 'preserve')
+    t.text = text
+    run.append(t)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+
+def rebuild_with_native_shading(paragraph, new_text):
+    # A. CLEANUP (Old Logic + Ghostbuster)
+    for child in paragraph._p:
+        if child.tag.endswith('hyperlink'):
+            paragraph._p.remove(child) # Links must be removed to be rebuilt
+        elif child.tag.endswith('r'):
+            # Check for images
+            if child.findall(qn('w:drawing')) or child.findall(qn('w:pict')):
+                if child.text: child.text = "" 
+            else:
+                # 1. Empty the text
+                if child.text: child.text = ""
+                
+                # 2. Kill the Ghost (Remove old shading properties)
+                rPr = child.find(qn('w:rPr'))
+                if rPr is not None:
+                    shd = rPr.find(qn('w:shd'))
+                    if shd is not None:
+                        rPr.remove(shd)
+                    hl = rPr.find(qn('w:highlight'))
+                    if hl is not None:
+                        rPr.remove(hl)
+
+    if not new_text or str(new_text) == "nan": return
+
+    pattern = r'(</b>|<b>|</i>|<i>|</u>|<u>|</c>|<c color=".*?">|</bg>|<bg color=".*?">|</link>|<link url=".*?">)'
+    tokens = re.split(pattern, str(new_text))
+
+    bold = False
+    italic = False
+    underline = False
+    color = None
+    bg_color = None
+    link_url = None
+
+    for token in tokens:
+        if not token: continue
+
+        if token == "<b>": bold = True
+        elif token == "</b>": bold = False
+        elif token == "<i>": italic = True
+        elif token == "</i>": italic = False
+        elif token == "<u>": underline = True
+        elif token == "</u>": underline = False
+        elif token.startswith('<c color="'):
+            m = re.search(r'color="(.*?)"', token)
+            if m: color = m.group(1)
+        elif token == "</c>": color = None
+        
+        elif token.startswith('<bg color="'):
+            m = re.search(r'color="(.*?)"', token)
+            if m: bg_color = m.group(1)
+        elif token == "</bg>": bg_color = None
+        
+        elif token.startswith('<link url="'):
+            m = re.search(r'url="(.*?)"', token)
+            if m: link_url = m.group(1)
+        elif token == "</link>": link_url = None
+        
+        # --- Content ---
+        elif not token.startswith("<"):
+            if link_url:
+                add_hyperlink_run(paragraph, link_url, token, bold, italic, underline, color, bg_color)
+            else:
+                # NATIVE ADD RUN
+                run = paragraph.add_run(token)
+                
+                if bold: run.bold = True
+                if italic: run.font.italic = True
+                if underline: run.font.underline = True
+                if color: run.font.color.rgb = hex_to_rgb(color)
+                
+                # Apply New Shading
+                if bg_color:
+                    apply_shading_to_run(run, bg_color)
+
+
+def get_target_paragraphs_linear(doc):
+    paragraphs = []
+    
+    for element in doc.element.body:
+        if element.tag.endswith('p'):
+            # It's a main body paragraph
+            paragraphs.append(Paragraph(element, doc))
+            
+        elif element.tag.endswith('tbl'):
+            # It's a table, dive into it
+            tbl = Table(element, doc)
+            for row in tbl.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        paragraphs.append(p)
+    return paragraphs
+
+print("Step 1: Upload ORIGINAL Word (.docx)")
+upl_word = files.upload()
+word_filename = next(iter(upl_word))
+
+print("\nStep 2: Upload TRANSLATED Excel (.xlsx)")
+upl_excel = files.upload()
+excel_filename = next(iter(upl_excel))
+
+print("\nRebuilding...")
+doc = Document(io.BytesIO(upl_word[word_filename]))
+df = pd.read_excel(io.BytesIO(upl_excel[excel_filename]))
+
+all_paragraphs = get_target_paragraphs_linear(doc)
+
+max_len = min(len(all_paragraphs), len(df))
+
+for i in range(max_len):
+    # Column B is index 1.
+    trans_text = df.iloc[i, 1] 
+    rebuild_with_native_shading(all_paragraphs[i], trans_text)
+
+output_file = word_filename.replace('.docx', '_rebuilt.docx')
+doc.save(output_file)
+print(f"Done! Download: {output_file}")
+files.download(output_file)
