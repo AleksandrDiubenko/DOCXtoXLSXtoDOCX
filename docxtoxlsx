@@ -1,0 +1,138 @@
+import io
+import pandas as pd
+from google.colab import files
+from docx import Document
+from docx.oxml.ns import qn
+from docx.text.run import Run
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+
+# --- Formatting Helpers ---
+def get_shading_color(run):
+    """Checks for w:shd (Character Shading) in the XML."""
+    rPr = run._element.rPr
+    if rPr is not None:
+        shd = rPr.find(qn('w:shd'))
+        if shd is not None:
+            return shd.get(qn('w:fill')) 
+    return None
+
+def format_run_text(run):
+    text = run.text
+    if not text: return ""
+    
+    # 1. Text Color
+    color_hex = None
+    try:
+        if run.font.color and run.font.color.type == 1:
+            color_hex = str(run.font.color.rgb)
+    except: pass
+
+    # 2. Background Shading
+    bg_hex = get_shading_color(run)
+
+    # Open Tags
+    if bg_hex and bg_hex != "auto": text = f'<bg color="{bg_hex}">{text}'
+    if color_hex: text = f'<c color="{color_hex}">{text}'
+    if run.font.underline: text = f'<u>{text}'
+    if run.font.italic: text = f'<i>{text}'
+    if run.bold: text = f'<b>{text}'
+
+    # Close Tags
+    if run.bold: text = f'{text}</b>'
+    if run.font.italic: text = f'{text}</i>'
+    if run.font.underline: text = f'{text}</u>'
+    if color_hex: text = f'{text}</c>'
+    if bg_hex and bg_hex != "auto": text = f'{text}</bg>'
+    
+    return text
+
+def extract_paragraph_text(p, doc):
+    """
+    Extracts text and tags from a single paragraph object.
+    Used for both body paragraphs and table cell paragraphs.
+    """
+    # If paragraph is empty and has no links, return empty string
+    if not p.text.strip() and not p._element.findall(qn('w:hyperlink')):
+        return ""
+
+    xml_str = ""
+    for child in p._element:
+        if child.tag.endswith('hyperlink'):
+            # Handle Links
+            r_id = child.get(qn('r:id'))
+            url = None
+            if r_id in doc.part.rels:
+                url = doc.part.rels[r_id].target_ref
+            
+            link_text = ""
+            for subnode in child:
+                if subnode.tag.endswith('r'):
+                    link_text += format_run_text(Run(subnode, p))
+            
+            if url:
+                xml_str += f'<link url="{url}">{link_text}</link>'
+            else:
+                xml_str += link_text
+
+        elif child.tag.endswith('r'):
+            # Handle Text (Skip images)
+            if child.findall(qn('w:drawing')) or child.findall(qn('w:pict')):
+                continue
+            xml_str += format_run_text(Run(child, p))
+            
+    return xml_str
+
+def extract_all_content_linear(doc):
+    """
+    Iterates through the document body to grab paragraphs and tables 
+    in the order they appear.
+    """
+    data = []
+    
+    # doc.element.body is the XML root of the document content
+    for element in doc.element.body:
+        if element.tag.endswith('p'):
+            # It's a Paragraph
+            p = Paragraph(element, doc)
+            data.append(extract_paragraph_text(p, doc))
+            
+        elif element.tag.endswith('tbl'):
+            # It's a Table
+            tbl = Table(element, doc)
+            # Iterate Rows -> Cells -> Paragraphs
+            for row in tbl.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        data.append(extract_paragraph_text(p, doc))
+                        
+    return data
+
+# --- Main Execution ---
+print("Phase 1: Upload Word file")
+uploaded = files.upload()
+filename = next(iter(uploaded))
+
+doc = Document(io.BytesIO(uploaded[filename]))
+
+# USE NEW LINEAR EXTRACTION (Includes Tables)
+extracted_data = extract_all_content_linear(doc)
+
+# Create DataFrame
+df = pd.DataFrame({
+    'Source Text': extracted_data,
+    'Translation': "" 
+})
+
+out_file = filename.replace('.docx', '_for_translation.xlsx')
+
+with pd.ExcelWriter(out_file, engine='openpyxl') as writer:
+    df.to_excel(writer, index=False, sheet_name='Sheet1')
+    
+    worksheet = writer.sheets['Sheet1']
+    worksheet.column_dimensions['A'].width = 60
+    worksheet.column_dimensions['B'].width = 60
+
+print(f"Processing complete. Text and Tables extracted.")
+print(f"Downloading {out_file}...")
+files.download(out_file)
